@@ -19,98 +19,118 @@
 
 ---
 
-## 🚀 Các Tính Năng Cốt Lõi
+## 🚀 Tính Năng Nổi Bật
 
-### 1. 📲 Quản Lý Gọi Món & Hiển Thị Nhà Bếp (POS & KDS Flow)
-* **Menu & Order Management:** Giao diện gọi món trực quan, phân loại danh mục món ăn linh hoạt, hỗ trợ tạo đơn theo từng bàn (`tableId`).
-* **Real-time Kitchen Display System (KDS):** Đơn hàng từ POS tự động đẩy xuống màn hình nhà bếp (`/kitchen`) lập tức.
-* **Hủy món thời gian thực (Item Cancellation):** Hỗ trợ hủy món trực tiếp từ màn hình Menu. Khi một món bị hủy, sự kiện `item_cancelled` lập tức phát tới KDS để cập nhật UI đặc biệt (gạch ngang chữ `line-through`, đổi nền xám, giảm độ mờ 50%) giúp đầu bếp nhận biết ngay mà không cần tải lại trang.
+### 🍽️ Quản Lý Gọi Món & Nhà Bếp (POS & KDS)
 
-### 2. 💳 Cổng Thanh Thanh Toán Đa Dạng (Advanced Payment Gateway)
-Hệ thống quản lý trạng thái hóa đơn tập trung thông qua `paymentModel.js`:
-* **Tiền mặt (Cash):** Xử lý tại quầy bởi Admin/Staff, cập nhật trạng thái bàn sang đã thanh toán thông qua cơ chế `markTablePaid()`.
-* **Tích hợp VNPAY (Mới):** Tạo link thanh toán động mã hóa bảo mật SHA512, tự động redirect qua cổng Sandbox của VNPAY. Hệ thống xử lý dữ liệu trả về song song qua 2 luồng: **Return URL** (đồng bộ phía Client) và **IPN Webhook** (bảo mật ngầm phía Server). Đảm bảo kiểm tra chéo số tiền (Amount Validation) và chống trùng lặp giao dịch (Idempotent Transaction).
-* **Tương Thích Ngược Razorpay:** Duy trì toàn bộ luồng xử lý và webhook của hệ thống Razorpay cũ, đảm bảo các log giao dịch cũ hoạt động ổn định.
-
-### 3. 🤖 Trợ Lý Ảo Lai Thông Minh (Hybrid AI Chatbot)
-Kiến trúc xử lý tin nhắn 3 tầng tối ưu chi phí vận hành (Chỉ tốn ~$3-$5/tháng cho tần suất 1000 cuộc hội thoại/ngày):
-* **Tầng 1 - Khớp từ khóa cố định (Rule-Based Matching | Miễn phí | <1ms):** Tự động phản hồi các câu hỏi tần suất cao như: giờ mở cửa, địa chỉ, thực đơn.
-* **Tầng 2 - Trí tuệ nhân tạo (AI Classification & Parameter Extraction | ~$0.0005 | ~500ms):** Chuyển tiếp các câu thoại tự nhiên đến mô hình `gpt-3.5-turbo` của OpenAI để phân tích ý định (Intent). Nếu khách hỏi về đơn hàng hoặc bàn trống, AI sẽ tự động bóc tách tham số (`orderId`, `tableNumber`), thực hiện truy vấn trực tiếp vào MongoDB để trả về câu trả lời chính xác theo thời gian thực.
-* **Tầng 3 - Phòng ngự & Chuyển giao (Human Handoff):** Tự động chuyển hướng cuộc hội thoại tới nhân viên trực thông qua Staff Panel (`/staff/chat`) trong trường hợp AI bị timeout (10 giây), lỗi kết nối API hoặc khi khách hàng yêu cầu gặp người thật.
-
-### 4. 📊 Dashboard Báo Cáo Doanh Thu (Data-Driven Metrics)
-* **Thống kê thời gian thực:** Toàn bộ chỉ số tổng doanh thu (VND), tổng đơn hàng, tổng khách hàng, tổng món ăn, số lượng bàn hoạt động đều được tính toán bằng các hàm Aggregate trực tiếp từ cơ sở dữ liệu (MongoDB).
-* **Xuất Báo Cáo Excel Chuyên Nghiệp:** Tích hợp tính năng xuất file báo cáo tổng hợp định dạng Excel (`.xlsx`) gồm 3 Worksheet phân tách: Tổng quan dòng tiền (Overview), Thống kê hiệu suất món ăn (Dish Stats), và Hiệu suất danh mục (Category Stats) kèm cấu hình style tiêu đề chuyên nghiệp.
+* Quản lý thực đơn, bàn ăn và đơn hàng trên một giao diện trực quan.
+* Hỗ trợ tạo và cập nhật đơn hàng theo từng bàn.
+* Đồng bộ đơn hàng giữa quầy phục vụ và nhà bếp theo thời gian thực bằng Socket.IO.
+* Hỗ trợ hủy món trực tiếp từ giao diện gọi món, trạng thái được cập nhật ngay trên màn hình nhà bếp mà không cần tải lại trang.
 
 ---
 
-## 📁 Cấu Trúc File Dự Án Cốt Lõi
+### 💳 Thanh Toán Đa Phương Thức
 
-Res_POS_System/
-├── pos-backend/                # SOURCE CODE BACKEND (Node.js/Express)
-│   ├── config/                 # Cấu hình môi trường và cấu hình cổng VNPAY
-│   ├── controllers/            # Logic nghiệp vụ (Payment, Report, Order, Dish)
-│   ├── models/                 # Mongoose Schemas (paymentModel, orderModel, tableModel, chatMessage)
-│   ├── routes/                 # RESTful API Endpoints
-│   ├── sockets/                # Trình điều hướng Socket.IO (chat.socket.js, kitchen.socket.js)
-│   ├── services/               # Tầng dịch vụ thông minh (ai.service.js, chatbot.service.js)
-│   └── .env.example            # Bản mẫu cấu hình biến môi trường hệ thống
-│
-└── pos-frontend/               # SOURCE CODE FRONTEND (React + Vite)
-├── src/
-│   ├── components/         # Các thành phần UI tái sử dụng (Dashboard, Chat, KitchenCard)
-│   ├── https/              # Trình wrapper gọi API (Axios instance & endpoint helpers)
-│   ├── pages/              # Trang giao diện chính (/staff/chat, /chat/test, /kitchen, /menu)
-│   └── redux/              # Centralized State Management (chatSlice, orderSlice)
+* Hỗ trợ thanh toán bằng tiền mặt.
+* Tích hợp cổng thanh toán VNPAY.
+* Hỗ trợ Razorpay cho các giao dịch trực tuyến.
+* Tự động cập nhật trạng thái thanh toán và đồng bộ dữ liệu đơn hàng trên toàn hệ thống.
+* Quản lý các trạng thái giao dịch: `pending`, `paid`, `failed`, `expired`, `refunded`.
 
 ---
 
-🧪 Quy Trình Kiểm Thử Các Tính Năng Hệ Thống
-1. Luồng Chat Hỗ Trợ Kép (Staff <=> Customer)
-Mở đồng thời hai cửa sổ ẩn danh trên trình duyệt để kiểm tra tính năng đồng bộ tin nhắn cực hạn:
+### 🤖 Chatbot Hỗ Trợ Khách Hàng
 
-Cửa sổ 1 (Nhân viên trực): Truy cập http://localhost:5173/staff/chat, đăng nhập và bật nút trạng thái sang Online (Xanh) để kích hoạt kết nối phòng trực staff_room.
+* Tự động trả lời các câu hỏi thường gặp như giờ mở cửa, địa chỉ và thực đơn.
+* Hỗ trợ tra cứu thông tin đơn hàng và trạng thái bàn.
+* Kết hợp AI và dữ liệu hệ thống để cung cấp phản hồi chính xác hơn.
+* Cho phép chuyển cuộc trò chuyện sang nhân viên khi khách hàng cần hỗ trợ trực tiếp.
 
-Cửa sổ 2 (Giả lập Khách hàng): Truy cập http://localhost:5173/chat/test (Trang test simulator không cần đăng nhập, tự động sinh mã khách ngẫu nhiên).
+---
 
-Kịch bản test:
+### 💬 Chat Thời Gian Thực
 
-Test Rule-Based: Tại tab Khách hàng nhập "Nhà hàng mở cửa lúc mấy giờ?" -> Hệ thống phản hồi ngay tức thì (<1ms) không tốn phí API OpenAI.
+* Hỗ trợ nhắn tin trực tiếp giữa khách hàng và nhân viên.
+* Đồng bộ tin nhắn theo thời gian thực bằng WebSocket.
+* Quản lý lịch sử hội thoại và trạng thái hỗ trợ khách hàng.
 
-Test AI Trích Xuất Dữ Liệu: Nhập "Kiểm tra hộ tôi đơn hàng ORD001 xem đã làm xong chưa" -> Xem terminal backend để thấy AI bóc tách orderId: ORD001, tự động tìm trong DB và trả về trạng thái món ăn.
+---
 
-Test Gọi Nhân Viên: Nhập "Tôi muốn gặp nhân viên" hoặc nhập chuỗi ký tự rác liên tục -> Hệ thống tự động kích hoạt luồng CALL_STAFF, thông báo đẩy lập tức hiển thị bên màn hình Staff để nhân viên bấm nút nhận chat.
+### 📊 Dashboard & Báo Cáo
 
-2. Quy Trình Thanh Toán VNPAY
-Đăng nhập tài khoản quyền Admin/Staff, tại mục Quản lý bàn/Đơn hàng, các đơn chưa thanh toán sẽ có nhãn màu vàng pending.
+* Thống kê doanh thu, đơn hàng, khách hàng và món ăn.
+* Hiển thị dữ liệu trực quan theo thời gian thực.
+* Xuất báo cáo Excel để phục vụ quản lý và đối soát dữ liệu.
+* Theo dõi hiệu suất món ăn và danh mục sản phẩm.
 
-Click chọn trạng thái đơn hàng -> Hệ thống điều hướng sang trang thanh toán chi tiết /payment.
+---
 
-Chọn phương thức Bank (VNPAY) -> Click thanh toán -> Hệ thống tự động sinh mã hóa bảo mật, ký SHA512 và đưa người dùng tới giao diện thanh toán Sandbox của VNPAY.
+### 🔐 Phân Quyền & Bảo Mật
 
-Sử dụng thông tin thẻ thử nghiệm do VNPAY cung cấp (Ví dụ: Ngân hàng Thử nghiệm NCB) để tiến hành OTP giả lập.
+* Xác thực người dùng bằng JWT.
+* Phân quyền theo vai trò: Admin, Staff và Customer.
+* Bảo vệ các API và chức năng quản trị hệ thống.
 
-Sau khi hoàn tất giao dịch, VNPAY điều hướng trở lại trang /payment-result, đồng thời Webhook IPN chạy ngầm lập tức đổi trạng thái đơn hàng từ pending sang paid trên toàn hệ thống.
+---
+---
 
-3. Luồng Hủy Món Nhà Bếp (KDS)
-Mở song song màn hình Menu gọi món http://localhost:5173/menu và màn hình nhà bếp http://localhost:5173/kitchen.
+## 🧪 Hướng Dẫn Kiểm Thử Hệ Thống
 
-Tiến hành đặt đơn gồm 3 món từ Menu -> Màn hình nhà bếp lập tức hiển thị thẻ món ăn (Kitchen Card) theo thời gian thực nhờ kết nối Socket.
+### 💬 Chat Hỗ Trợ Khách Hàng
 
-Tại giao diện Menu, bấm vào biểu tượng thùng rác (🗑️) tại 1 món bất kỳ trong đơn vừa gọi để thực hiện hủy món.
+Mở đồng thời hai trình duyệt hoặc hai cửa sổ ẩn danh:
 
-Quan sát màn hình KDS, món ăn đó lập tức thay đổi hiệu ứng hiển thị (gạch ngang, mờ đi) mà không cần F5 tải lại trang, giúp nhà bếp tránh việc làm nhầm món đã hủy.
+* **Nhân viên:** `/staff/chat`
+* **Khách hàng:** `/chat/test`
 
-🔒 Quản Lý Trạng Thái Thanh Toán Tiêu Chuẩn
-Mọi giao dịch điện tử trong cơ sở dữ liệu hệ thống được đồng bộ hóa nghiêm ngặt theo các trạng thái (Enum) sau:
+Kiểm tra các chức năng:
 
-pending: Đơn hàng vừa khởi tạo, đang chờ quét mã QR hoặc xử lý quẹt thẻ.
+* Gửi câu hỏi phổ biến để nhận phản hồi tự động.
+* Hỏi trạng thái đơn hàng để kiểm tra khả năng truy vấn dữ liệu.
+* Yêu cầu gặp nhân viên để kiểm tra tính năng chuyển tiếp cuộc trò chuyện theo thời gian thực.
 
-paid: Giao dịch thành công, tiền đã ghi nhận, hệ thống khóa nút thanh toán để tránh lặp lệnh.
+---
 
-failed: Người dùng chủ động hủy giao dịch tại cổng thanh toán hoặc thẻ bị từ chối.
+### 💳 Thanh Toán VNPAY
 
-expired: Quá thời hạn thực hiện phiên giao dịch bảo mật do VNPAY quy định.
+1. Tạo một đơn hàng chưa thanh toán.
+2. Truy cập trang thanh toán.
+3. Chọn phương thức **VNPAY**.
+4. Thực hiện thanh toán bằng tài khoản thử nghiệm của VNPAY Sandbox.
+5. Xác nhận:
 
-refunded: Trạng thái đơn hàng đã được thực hiện hoàn tiền thành công (Hỗ trợ cấu hình sẵn model).
-"""
+   * Giao dịch được xử lý thành công.
+   * Trạng thái đơn hàng chuyển từ `pending` sang `paid`.
+   * Dữ liệu được đồng bộ tự động trên toàn hệ thống.
+
+---
+
+### 🍳 Màn Hình Nhà Bếp (KDS)
+
+Mở đồng thời:
+
+* Trang gọi món: `/menu`
+* Trang nhà bếp: `/kitchen`
+
+Thực hiện các bước:
+
+1. Tạo đơn hàng mới từ giao diện gọi món.
+2. Kiểm tra đơn hàng hiển thị ngay trên màn hình nhà bếp.
+3. Hủy một món trong đơn hàng.
+4. Xác nhận món ăn được cập nhật trạng thái hủy theo thời gian thực mà không cần tải lại trang.
+
+---
+
+## 🔒 Trạng Thái Thanh Toán
+
+| Trạng thái | Mô tả                           |
+| ---------- | ------------------------------- |
+| `pending`  | Đang chờ thanh toán             |
+| `paid`     | Thanh toán thành công           |
+| `failed`   | Thanh toán thất bại hoặc bị hủy |
+| `expired`  | Phiên thanh toán hết hạn        |
+| `refunded` | Đã hoàn tiền                    |
+
+```
+```

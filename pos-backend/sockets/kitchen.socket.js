@@ -14,6 +14,7 @@ const Order = require("../models/orderModel");
 const { default: mongoose } = require("mongoose");
 
 const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(id);
+const PENDING_APPROVAL_STATUS = "PENDING_APPROVAL";
 
 /**
  * Biến global lưu trạng thái online của kitchen staff
@@ -177,7 +178,9 @@ const kitchenSocketHandler = (io) => {
             try {
                 const { filter = 'all' } = data || {};
 
-                let query = {};
+                let query = {
+                    orderStatus: { $ne: PENDING_APPROVAL_STATUS }
+                };
 
                 // Filter by kitchen status
                 if (filter !== 'all') {
@@ -279,6 +282,11 @@ async function emitNewOrderToKitchen(io, order) {
     try {
         // Fetch table info if available
         const fullOrder = await order.populate("table");
+
+        if (`${fullOrder?.orderStatus || ""}`.toUpperCase() === PENDING_APPROVAL_STATUS) {
+            console.log(`⏸️ Skip kitchen emit for pending approval order: ${fullOrder._id}`);
+            return;
+        }
 
         // Format order data for kitchen (no price info)
         const kitchenOrderData = {

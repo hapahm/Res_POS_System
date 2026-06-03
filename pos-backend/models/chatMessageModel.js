@@ -17,24 +17,22 @@ const mongoose = require("mongoose");
 
 const chatMessageSchema = new mongoose.Schema({
     // Người gửi tin nhắn (tham chiếu đến User model)
-    // Cho phép cả ObjectId (staff đã đăng ký) và string (khách test dùng UUID)
     sender: {
-        type: mongoose.Schema.Types.Mixed,
+        type: mongoose.Schema.Types.ObjectId,
         ref: "User",
-        required: false
+        required: true
     },
 
     // Vai trò của người gửi: customer (khách) hoặc staff (nhân viên)
     senderRole: {
         type: String,
-        enum: ["customer", "staff"],
+        enum: ["customer", "staff", "chatbot"],
         required: true
     },
 
-    // Người nhận tin nhắn (có thể null nếu là tin nhắn từ chatbot)
-    // Có thể là ObjectId (staff) hoặc string (customer UUID)
+    // Người nhận tin nhắn (có thể null nếu là broadcast/system)
     receiver: {
-        type: mongoose.Schema.Types.Mixed,
+        type: mongoose.Schema.Types.ObjectId,
         ref: "User",
         default: null
     },
@@ -55,10 +53,10 @@ const chatMessageSchema = new mongoose.Schema({
         required: true
     },
 
-    // ID cuộc hội thoại (để nhóm các tin nhắn cùng conversation)
-    // Format: "conv_customerID" hoặc "conv_customerID_staffID"
+    // ID cuộc hội thoại (tham chiếu Conversation)
     conversationId: {
-        type: String,
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Conversation",
         required: true,
         index: true  // Tạo index để query nhanh
     },

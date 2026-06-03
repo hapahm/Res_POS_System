@@ -13,6 +13,7 @@
  */
 
 const ChatMessage = require("../models/chatMessageModel");
+const Conversation = require("../models/conversationModel");
 const ChatbotService = require("../services/chatbot.service");
 const User = require("../models/userModel");
 const Order = require("../models/orderModel");
@@ -20,6 +21,13 @@ const Table = require("../models/tableModel");
 const mongoose = require("mongoose");
 
 const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(id);
+const normalizeRole = (role = "") => `${role}`.trim().toLowerCase();
+const isStaffRole = (role = "") => ["staff", "admin", "cashier", "waiter"].includes(normalizeRole(role));
+const CHAT_ROOMS = {
+    STAFF: "chat_staff_room",
+    CUSTOMER: "chat_customer_room"
+};
+const GUEST_EMAIL_DOMAIN = "guest.chat.local";
 
 /**
  * Biến global lưu trạng thái online của staff
@@ -28,6 +36,8 @@ const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(id);
  * - false: staff offline
  */
 const staffOnlineMap = {};
+const STAFF_REQUEST_DEDUP_MS = 2500;
+const recentStaffRequestMap = new Map();
 
 /**
  * Biến lưu phiên chat đang active giữa customer-staff
@@ -35,6 +45,211 @@ const staffOnlineMap = {};
  * Dùng để route tin nhắn đến đúng staff đang chat
  */
 const activeChats = {};
+let chatbotUserCache = null;
+
+const asObjectId = (id) => (isValidObjectId(id) ? new mongoose.Types.ObjectId(id) : null);
+
+const normalizeGuestExternalId = (externalId = "") =>
+    `${externalId}`.trim().toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 40);
+
+const buildGuestEmail = (externalId) => {
+    const normalized = normalizeGuestExternalId(externalId);
+    return `guest_${normalized || "anonymous"}@${GUEST_EMAIL_DOMAIN}`;
+};
+
+const buildGuestPhone = (externalId) => {
+    const normalized = normalizeGuestExternalId(externalId);
+    const source = normalized || `guest${Date.now()}`;
+    let hash = 0;
+    for (let i = 0; i < source.length; i++) {
+        hash = (hash * 31 + source.charCodeAt(i)) >>> 0;
+    }
+
+    const digits = `${hash}`.padStart(10, "0").slice(0, 10);
+    return digits === "0000000000" ? "0123456789" : digits;
+};
+
+async function findGuestUserByExternalId(externalId) {
+    const guestEmail = buildGuestEmail(externalId);
+    return User.findOne({ email: guestEmail, role: "customer" });
+}
+
+async function generateUniqueGuestPhone(externalId) {
+    const base = buildGuestPhone(externalId);
+    for (let attempt = 0; attempt < 50; attempt++) {
+        const numeric = `${parseInt(base, 10) + attempt}`.replace(/\D/g, "").padStart(10, "0").slice(-10);
+        const existed = await User.exists({ phone: numeric });
+        if (!existed) {
+            return numeric;
+        }
+    }
+
+    return `${Date.now()}`.slice(-10);
+}
+
+async function getOrCreateGuestUser(externalId) {
+    let guestUser = await findGuestUserByExternalId(externalId);
+    if (guestUser) {
+        return guestUser;
+    }
+
+    const normalized = normalizeGuestExternalId(externalId);
+    const email = buildGuestEmail(externalId);
+    const phone = await generateUniqueGuestPhone(externalId);
+
+    try {
+        guestUser = await User.create({
+            name: `Guest ${normalized.slice(-6) || "User"}`,
+            email,
+            phone,
+            password: `guest_${normalized || Date.now()}`,
+            role: "customer",
+            accountStatus: "approved"
+        });
+    } catch (error) {
+        if (error?.code === 11000) {
+            const existingByEmail = await User.findOne({ email, role: "customer" });
+            if (existingByEmail) {
+                return existingByEmail;
+            }
+        }
+        throw error;
+    }
+
+    return guestUser;
+}
+
+async function ensureChatbotUser() {
+    if (chatbotUserCache) {
+        return chatbotUserCache;
+    }
+
+    let chatbotUser = await User.findOne({ role: "chatbot" }).select("_id name email role");
+    if (!chatbotUser) {
+        chatbotUser = await User.create({
+            name: "POS Chatbot",
+            email: "chatbot@pos.system",
+            phone: "0000000000",
+            password: `chatbot_${Date.now()}`,
+            role: "chatbot",
+            accountStatus: "approved"
+        });
+    }
+
+    chatbotUserCache = chatbotUser;
+    return chatbotUser;
+}
+
+async function findOrCreateConversation({ customerId, staffId = null }) {
+    const customerObjectId = asObjectId(customerId);
+    if (!customerObjectId) {
+        throw new Error("customerId không hợp lệ");
+    }
+
+    const staffObjectId = asObjectId(staffId);
+    let conversation = await Conversation.findOne({ customerId: customerObjectId }).sort({ updatedAt: -1 });
+
+    if (!conversation) {
+        conversation = await Conversation.create({
+            customerId: customerObjectId,
+            staffId: staffObjectId,
+            lastMessage: "",
+            lastMessageAt: new Date(),
+            unreadCount: 0
+        });
+        return conversation;
+    }
+
+    if (!conversation.staffId && staffObjectId) {
+        conversation.staffId = staffObjectId;
+        await conversation.save();
+    }
+
+    return conversation;
+}
+
+async function updateConversationOnMessage({ conversationId, message, increaseUnread }) {
+    const updatePayload = {
+        lastMessage: message,
+        lastMessageAt: new Date()
+    };
+
+    if (increaseUnread) {
+        updatePayload.$inc = { unreadCount: 1 };
+    }
+
+    if (updatePayload.$inc) {
+        await Conversation.findByIdAndUpdate(conversationId, {
+            lastMessage: updatePayload.lastMessage,
+            lastMessageAt: updatePayload.lastMessageAt,
+            $inc: updatePayload.$inc
+        });
+        return;
+    }
+
+    await Conversation.findByIdAndUpdate(conversationId, {
+        lastMessage: updatePayload.lastMessage,
+        lastMessageAt: updatePayload.lastMessageAt
+    });
+}
+
+async function createChatMessage({
+    sender,
+    senderRole,
+    receiver,
+    message,
+    messageType,
+    customerId,
+    staffId,
+    increaseUnread
+}) {
+    const conversation = await findOrCreateConversation({ customerId, staffId });
+    const senderObjectId = asObjectId(sender);
+    const receiverObjectId = asObjectId(receiver);
+
+    if (!senderObjectId) {
+        throw new Error("sender không hợp lệ");
+    }
+
+    const savedMessage = await ChatMessage.create({
+        sender: senderObjectId,
+        senderRole,
+        receiver: receiverObjectId,
+        message,
+        messageType,
+        conversationId: conversation._id
+    });
+
+    await updateConversationOnMessage({
+        conversationId: conversation._id,
+        message,
+        increaseUnread
+    });
+
+    return { savedMessage, conversation };
+}
+
+async function resolveConversationForHistory({ conversationId, customerId }) {
+    if (isValidObjectId(conversationId)) {
+        const byId = await Conversation.findById(conversationId);
+        if (byId) {
+            return byId;
+        }
+    }
+
+    const candidateCustomerId = customerId || conversationId;
+    const resolvedCustomerId = asObjectId(candidateCustomerId);
+    if (resolvedCustomerId) {
+        return Conversation.findOne({ customerId: resolvedCustomerId }).sort({ updatedAt: -1 });
+    }
+
+    const guestUser = await findGuestUserByExternalId(candidateCustomerId);
+    if (!guestUser) {
+        return null;
+    }
+
+    return Conversation.findOne({ customerId: guestUser._id }).sort({ updatedAt: -1 });
+}
 
 /**
  * ============================================
@@ -319,6 +534,71 @@ async function processAIResponse(botResponse) {
     }
 }
 
+async function getCustomerInfo(customerId) {
+    if (!isValidObjectId(customerId)) {
+        return null;
+    }
+
+    return User.findById(customerId).select("name email phone");
+}
+
+async function emitStaffRequest(io, { customerId, conversationId, message, source = "unknown" }) {
+    const dedupKey = `${customerId}:${conversationId}`;
+    const now = Date.now();
+    const lastRequestAt = recentStaffRequestMap.get(dedupKey) || 0;
+
+    if (now - lastRequestAt < STAFF_REQUEST_DEDUP_MS) {
+        return {
+            customerId,
+            conversationId,
+            message: message || "Khách hàng yêu cầu hỗ trợ từ nhân viên",
+            timestamp: new Date().toISOString(),
+            source,
+            deduped: true
+        };
+    }
+
+    recentStaffRequestMap.set(dedupKey, now);
+
+    // Dọn dữ liệu cũ để tránh map tăng không giới hạn.
+    for (const [key, value] of recentStaffRequestMap.entries()) {
+        if (now - value > STAFF_REQUEST_DEDUP_MS * 4) {
+            recentStaffRequestMap.delete(key);
+        }
+    }
+
+    const customerInfo = await getCustomerInfo(customerId);
+    const payload = {
+        customerId,
+        customerName: customerInfo ? customerInfo.name : `Khách hàng ${customerId}`,
+        customerInfo,
+        conversationId,
+        message: message || "Khách hàng yêu cầu hỗ trợ từ nhân viên",
+        timestamp: new Date().toISOString(),
+        source,
+        deduped: false
+    };
+
+    io.to(CHAT_ROOMS.STAFF).emit("staff_request", payload);
+    io.to(CHAT_ROOMS.STAFF).emit("customer_chat_activity", {
+        customerId,
+        customerName: payload.customerName,
+        conversationId,
+        lastMessage: payload.message,
+        timestamp: payload.timestamp,
+        activityType: "staff_request"
+    });
+
+    io.to(`user_${customerId}`).emit("staff_request_sent", {
+        conversationId,
+        status: "pending",
+        onlineStaffCount: ChatbotService.getOnlineStaffCount(staffOnlineMap),
+        message: "Đã gửi yêu cầu hỗ trợ đến nhân viên"
+    });
+
+    return payload;
+}
+
 /**
  * MAIN SOCKET HANDLER
  * @param {SocketIO.Server} io - Socket.IO server instance
@@ -338,39 +618,70 @@ const chatSocketHandler = (io) => {
         socket.on("user_connect", async (userData) => {
             try {
                 const { userId, role } = userData;
+                const normalizedRole = normalizeRole(role);
+                const rawUserId = `${userId}`;
+                const isGuestExternalId = !isValidObjectId(rawUserId);
 
                 // Validate dữ liệu
-                if (!userId || !role) {
+                if (!userId || !normalizedRole) {
                     socket.emit("error", { message: "Thiếu userId hoặc role" });
                     return;
                 }
 
+                let existingUser = null;
+                if (isValidObjectId(rawUserId)) {
+                    existingUser = await User.findById(rawUserId).select("_id role");
+                } else if (normalizedRole === "customer") {
+                    existingUser = await getOrCreateGuestUser(rawUserId);
+                }
+
+                if (!existingUser) {
+                    socket.emit("error", { message: "User không tồn tại hoặc không hợp lệ" });
+                    return;
+                }
+
+                if (isGuestExternalId && normalizedRole !== "customer") {
+                    socket.emit("error", { message: "Guest chỉ được kết nối với role customer" });
+                    return;
+                }
+
+                const resolvedUserId = `${existingUser._id}`;
+                const resolvedRole = normalizeRole(existingUser.role || normalizedRole);
+
+                if (isGuestExternalId) {
+                    console.log(`👤 Guest mapped: external=${rawUserId} -> userId=${resolvedUserId}`);
+                }
+
                 // Gắn thông tin user vào socket (dùng cho các event sau)
-                socket.userId = userId;
-                socket.userRole = role;
+                socket.userId = resolvedUserId;
+                socket.userRole = resolvedRole;
+                socket.externalUserId = rawUserId;
 
                 // Join room riêng theo userId (để gửi tin cá nhân)
-                socket.join(`user_${userId}`);
+                socket.join(`user_${resolvedUserId}`);
+                if (resolvedRole === "customer") {
+                    socket.join(CHAT_ROOMS.CUSTOMER);
+                }
 
                 // Nếu là staff → đánh dấu online và join staff room
-                if (role === "staff") {
-                    staffOnlineMap[userId] = true;
-                    socket.join("staff_room");
+                if (isStaffRole(resolvedRole)) {
+                    staffOnlineMap[resolvedUserId] = true;
+                    socket.join(CHAT_ROOMS.STAFF);
 
                     // Broadcast số lượng staff online đến tất cả client
                     io.emit("staff_status_update", {
                         onlineStaffCount: ChatbotService.getOnlineStaffCount(staffOnlineMap)
                     });
 
-                    console.log(`👨‍💼 Staff ${userId} đã online và join staff_room`);
+                    console.log(`👨‍💼 Staff ${resolvedUserId} đã online và join ${CHAT_ROOMS.STAFF}`);
                     console.log(`📊 Tổng staff online:`, Object.keys(staffOnlineMap).length);
                 }
 
                 // Gửi xác nhận kết nối thành công
                 socket.emit("connection_success", {
                     message: "Kết nối thành công",
-                    role: role,
-                    userId: userId
+                    role: resolvedRole,
+                    userId: resolvedUserId
                 });
 
             } catch (error) {
@@ -392,6 +703,8 @@ const chatSocketHandler = (io) => {
                 const senderId = socket.userId;
                 const senderRole = socket.userRole;
 
+                console.log(`💬 send_message context | senderId=${senderId} | senderRole=${senderRole} | conversationId=${conversationId}`);
+
                 // Validate
                 if (!message || !senderId || !conversationId) {
                     socket.emit("error", { message: "Thiếu thông tin tin nhắn" });
@@ -411,13 +724,15 @@ const chatSocketHandler = (io) => {
                         // Lưu tin nhắn customer vào DB
                         try {
                             console.log(`💾 Lưu tin từ customer ${senderId} (CASE 1)...`);
-                            const customerMsg = await ChatMessage.create({
+                            const { savedMessage: customerMsg, conversation } = await createChatMessage({
                                 sender: senderId,
                                 senderRole: "customer",
                                 receiver: assignedStaffId,
-                                message: message,
+                                message,
                                 messageType: "user",
-                                conversationId: conversationId
+                                customerId: senderId,
+                                staffId: assignedStaffId,
+                                increaseUnread: true
                             });
                             console.log(`✅ Tin customer đã lưu thành công (ID: ${customerMsg._id})`);
                             console.log(`📊 Message details:`, {
@@ -427,7 +742,8 @@ const chatSocketHandler = (io) => {
                                 receiver: customerMsg.receiver,
                                 message: customerMsg.message,
                                 messageType: customerMsg.messageType,
-                                conversationId: customerMsg.conversationId,
+                                conversationId: conversationId,
+                                conversationRefId: conversation._id,
                                 createdAt: customerMsg.createdAt
                             });
 
@@ -437,6 +753,14 @@ const chatSocketHandler = (io) => {
                                 customerInfo = await User.findById(senderId).select("name email phone");
                             }
 
+                            io.to(CHAT_ROOMS.STAFF).emit("customer_chat_activity", {
+                                customerId: senderId,
+                                customerName: customerInfo ? customerInfo.name : `Khách hàng ${senderId}`,
+                                conversationId,
+                                lastMessage: message,
+                                timestamp: new Date().toISOString()
+                            });
+
                             // Gửi tin nhắn realtime đến staff
                             io.to(`user_${assignedStaffId}`).emit("receive_message", {
                                 ...customerMsg.toObject(),
@@ -444,7 +768,8 @@ const chatSocketHandler = (io) => {
                                 senderRole: "customer",
                                 senderName: customerInfo ? customerInfo.name : `Khách hàng ${senderId}`,
                                 senderInfo: customerInfo,
-                                conversationId: conversationId
+                                conversationId: conversationId,
+                                conversationRefId: conversation._id
                             });
 
                             // Xác nhận đã gửi cho customer
@@ -468,14 +793,30 @@ const chatSocketHandler = (io) => {
                         try {
                             // Lưu tin nhắn customer vào DB
                             console.log(`💾 Lưu tin từ customer ${senderId}...`);
-                            const customerMsg = await ChatMessage.create({
+                            const { conversation } = await createChatMessage({
                                 sender: senderId,
                                 senderRole: "customer",
-                                message: message,
+                                receiver: null,
+                                message,
                                 messageType: "user",
-                                conversationId: conversationId
+                                customerId: senderId,
+                                staffId: activeChats[senderId] || null,
+                                increaseUnread: true
                             });
-                            console.log(`✅ Tin customer đã lưu (ID: ${customerMsg._id})`);
+                            console.log(`✅ Tin customer đã lưu vào conversation ${conversation._id}`);
+
+                            let customerInfo = null;
+                            if (isValidObjectId(senderId)) {
+                                customerInfo = await User.findById(senderId).select("name email phone");
+                            }
+
+                            io.to(CHAT_ROOMS.STAFF).emit("customer_chat_activity", {
+                                customerId: senderId,
+                                customerName: customerInfo ? customerInfo.name : `Khách hàng ${senderId}`,
+                                conversationId,
+                                lastMessage: message,
+                                timestamp: new Date().toISOString()
+                            });
 
                             // ==========================================
                             // CHECK REGEX FIRST (FREE - No AI cost!)
@@ -529,13 +870,16 @@ const chatSocketHandler = (io) => {
 
                             // Lưu tin trả lời của chatbot vào DB
                             console.log(`💾 Lưu tin từ chatbot...`);
-                            const chatbotMsg = await ChatMessage.create({
-                                sender: "chatbot",
-                                senderRole: "staff",
+                            const chatbotUser = await ensureChatbotUser();
+                            const { savedMessage: chatbotMsg } = await createChatMessage({
+                                sender: chatbotUser._id,
+                                senderRole: "chatbot",
                                 receiver: senderId,
                                 message: botResponse.response,
                                 messageType: "chatbot",
-                                conversationId: conversationId
+                                customerId: senderId,
+                                staffId: activeChats[senderId] || null,
+                                increaseUnread: false
                             });
                             console.log(`✅ Tin chatbot đã lưu (ID: ${chatbotMsg._id})`);
 
@@ -543,34 +887,26 @@ const chatSocketHandler = (io) => {
                             socket.emit("receive_message", {
                                 ...chatbotMsg.toObject(),
                                 senderName: "🤖 POS Bot",
-                                intent: botResponse.intent
+                                senderRole: "chatbot",
+                                intent: botResponse.intent,
+                                conversationId
                             });
 
                             console.log(`🤖 Chatbot trả lời customer ${senderId} (Intent: ${botResponse.intent})`);
 
                             // Nếu customer yêu cầu gọi staff → notify staff room
                             if (botResponse.requiresStaff) {
-                                let customerInfo = null;
-                                if (isValidObjectId(senderId)) {
-                                    customerInfo = await User.findById(senderId).select("name email phone");
-                                }
-
-                                const staffRoomData = {
+                                const staffRoomData = await emitStaffRequest(io, {
                                     customerId: senderId,
-                                    customerName: customerInfo ? customerInfo.name : `Khách hàng ${senderId}`,
-                                    customerInfo: customerInfo,
-                                    conversationId: conversationId,
+                                    conversationId,
                                     message: "Khách hàng yêu cầu hỗ trợ từ nhân viên",
-                                    timestamp: new Date().toISOString()
-
-                                };
+                                    source: "chatbot_intent"
+                                });
 
                                 console.log(`\n📢 === BROADCAST STAFF_REQUEST ===`);
                                 console.log(`📊 Staff online:`, Object.keys(staffOnlineMap));
-                                console.log(`📊 Staff count:`, io.sockets.adapter.rooms.get("staff_room")?.size || 0);
+                                console.log(`📊 Staff count:`, io.sockets.adapter.rooms.get(CHAT_ROOMS.STAFF)?.size || 0);
                                 console.log(`📤 Gửi data:`, JSON.stringify(staffRoomData, null, 2));
-
-                                io.to("staff_room").emit("staff_request", staffRoomData);
 
                                 console.log(`📞 Customer ${senderId} yêu cầu gọi staff`);
                                 console.log(`===================================\n`);
@@ -584,7 +920,7 @@ const chatSocketHandler = (io) => {
                 }
 
                 // ===== XỬ LÝ KHI STAFF GỬI TIN =====
-                else if (senderRole === "staff") {
+                else if (isStaffRole(senderRole)) {
 
                     // Staff cần chỉ định customer nhận tin (targetCustomerId)
                     if (!targetCustomerId) {
@@ -593,13 +929,15 @@ const chatSocketHandler = (io) => {
                     }
 
                     // Lưu tin nhắn staff vào DB
-                    const savedMessage = await ChatMessage.create({
+                    const { savedMessage, conversation } = await createChatMessage({
                         sender: senderId,
                         senderRole: "staff",
                         receiver: targetCustomerId,
-                        message: message,
+                        message,
                         messageType: "staff",
-                        conversationId: conversationId
+                        customerId: targetCustomerId,
+                        staffId: senderId,
+                        increaseUnread: false
                     });
 
                     // Lấy thông tin staff (chỉ khi senderId là ObjectId)
@@ -612,7 +950,9 @@ const chatSocketHandler = (io) => {
                     io.to(`user_${targetCustomerId}`).emit("receive_message", {
                         ...savedMessage.toObject(),
                         senderName: staffInfo ? staffInfo.name : "Nhân viên",
-                        senderInfo: staffInfo
+                        senderInfo: staffInfo,
+                        conversationId,
+                        conversationRefId: conversation._id
                     });
 
                     // Xác nhận đã gửi cho staff
@@ -627,6 +967,61 @@ const chatSocketHandler = (io) => {
             } catch (error) {
                 console.error("❌ Lỗi khi gửi tin nhắn:", error);
                 socket.emit("error", { message: "Gửi tin nhắn thất bại", error: error.message });
+            }
+        });
+
+        // ==========================================
+        // EVENT 2.5: REQUEST STAFF (Customer gọi nhân viên)
+        // ==========================================
+        /**
+         * Customer emit event này để gọi nhân viên rõ ràng
+         * Data: { conversationId, message? }
+         */
+        socket.on("request_staff", async (data = {}) => {
+            try {
+                const senderId = socket.userId;
+                const senderRole = socket.userRole;
+                const { conversationId, message } = data;
+
+                if (senderRole !== "customer") {
+                    socket.emit("error", { message: "Chỉ customer mới được gọi nhân viên" });
+                    return;
+                }
+
+                if (!senderId || !conversationId) {
+                    socket.emit("error", { message: "Thiếu senderId hoặc conversationId" });
+                    return;
+                }
+
+                const assignedStaffId = activeChats[senderId];
+                if (assignedStaffId) {
+                    let staffInfo = null;
+                    if (isValidObjectId(assignedStaffId)) {
+                        staffInfo = await User.findById(assignedStaffId).select("name email");
+                    }
+
+                    socket.emit("staff_joined", {
+                        staffId: assignedStaffId,
+                        staffName: staffInfo ? staffInfo.name : "Nhân viên",
+                        staffInfo,
+                        conversationId,
+                        message: `${staffInfo ? staffInfo.name : "Nhân viên"} đang hỗ trợ bạn`
+                    });
+                    return;
+                }
+
+                const staffRequestData = await emitStaffRequest(io, {
+                    customerId: senderId,
+                    conversationId,
+                    message: message || "Khách hàng yêu cầu hỗ trợ từ nhân viên",
+                    source: "explicit_request"
+                });
+
+                console.log(`📞 Customer ${senderId} gửi request_staff`);
+                console.log(`📤 staff_request payload:`, JSON.stringify(staffRequestData, null, 2));
+            } catch (error) {
+                console.error("❌ Lỗi request_staff:", error);
+                socket.emit("error", { message: "Không thể gửi yêu cầu đến nhân viên" });
             }
         });
 
@@ -651,6 +1046,15 @@ const chatSocketHandler = (io) => {
                 // Lưu phiên chat active
                 activeChats[customerId] = staffId;
 
+                const acceptedConversation = await findOrCreateConversation({
+                    customerId,
+                    staffId
+                });
+                if (!acceptedConversation.staffId || `${acceptedConversation.staffId}` !== `${staffId}`) {
+                    acceptedConversation.staffId = asObjectId(staffId);
+                    await acceptedConversation.save();
+                }
+
                 // Staff join room của conversation
                 socket.join(`chat_${conversationId}`);
 
@@ -672,7 +1076,8 @@ const chatSocketHandler = (io) => {
                 // Xác nhận cho staff
                 socket.emit("chat_accepted", {
                     customerId: customerId,
-                    conversationId: conversationId
+                    conversationId: conversationId,
+                    conversationRefId: acceptedConversation._id
                 });
 
                 console.log(`✅ Staff ${staffId} đã nhận chat với customer ${customerId}`);
@@ -704,11 +1109,26 @@ const chatSocketHandler = (io) => {
                 console.log(`🔍 conversationId: ${conversationId}`);
                 console.log(`📊 limit: ${limit}`);
 
-                // Query tin nhắn từ DB (không populate vì sender/receiver có thể là UUID)
-                const messages = await ChatMessage.find({ conversationId })
+                const conversationDoc = await resolveConversationForHistory({
+                    conversationId,
+                    customerId: socket.userRole === "customer" ? socket.userId : conversationId
+                });
+
+                if (!conversationDoc) {
+                    socket.emit("chat_history", {
+                        conversationId,
+                        messages: [],
+                        count: 0
+                    });
+                    return;
+                }
+
+                const messages = await ChatMessage.find({ conversationId: conversationDoc._id })
                     .sort({ createdAt: 1 }) // Sắp xếp từ cũ đến mới
                     .limit(limit)
-                    .lean(); // Convert to plain objects
+                    .populate("sender", "name email role")
+                    .populate("receiver", "name email role")
+                    .lean();
 
                 console.log(`✅ Query thành công, tìm được ${messages.length} tin nhắn`);
 
@@ -717,23 +1137,14 @@ const chatSocketHandler = (io) => {
                     console.log(`📋 Last message:`, messages[messages.length - 1]);
                 }
 
-                // Manually populate user info only for valid ObjectIds
-                const enrichedMessages = await Promise.all(messages.map(async (msg) => {
-                    const enriched = { ...msg };
-
-                    // Populate sender if it's a valid ObjectId
-                    if (msg.sender && isValidObjectId(msg.sender)) {
-                        const senderUser = await User.findById(msg.sender).select("name email role");
-                        if (senderUser) enriched.senderInfo = senderUser;
-                    }
-
-                    // Populate receiver if it's a valid ObjectId
-                    if (msg.receiver && isValidObjectId(msg.receiver)) {
-                        const receiverUser = await User.findById(msg.receiver).select("name email role");
-                        if (receiverUser) enriched.receiverInfo = receiverUser;
-                    }
-
-                    return enriched;
+                const enrichedMessages = messages.map((msg) => ({
+                    ...msg,
+                    conversationRefId: conversationDoc._id,
+                    conversationId,
+                    senderInfo: msg.sender || null,
+                    receiverInfo: msg.receiver || null,
+                    sender: msg.sender?._id || msg.sender,
+                    receiver: msg.receiver?._id || msg.receiver
                 }));
 
                 console.log(`📤 Gửi ${enrichedMessages.length} tin nhắn cho client`);
@@ -776,6 +1187,17 @@ const chatSocketHandler = (io) => {
                     { $set: { isRead: true } }
                 );
 
+                const relatedMessages = await ChatMessage.find({ _id: { $in: messageIds } }).select("conversationId");
+                const conversationIds = [...new Set(relatedMessages.map((item) => `${item.conversationId}`))]
+                    .filter((id) => isValidObjectId(id));
+
+                if (conversationIds.length) {
+                    await Conversation.updateMany(
+                        { _id: { $in: conversationIds } },
+                        { $set: { unreadCount: 0 } }
+                    );
+                }
+
                 socket.emit("mark_read_success", { count: messageIds.length });
 
                 console.log(`✅ Đã đánh dấu ${messageIds.length} tin nhắn là đã đọc`);
@@ -795,43 +1217,44 @@ const chatSocketHandler = (io) => {
         socket.on("get_active_conversations", async () => {
             try {
                 // Chỉ staff mới được xem
-                if (socket.userRole !== "staff") {
+                if (!isStaffRole(socket.userRole)) {
                     socket.emit("error", { message: "Chỉ staff mới có quyền xem" });
                     return;
                 }
 
-                // Lấy các conversation có tin nhắn gần đây
-                const conversations = await ChatMessage.aggregate([
-                    // Group theo conversationId
-                    {
-                        $group: {
-                            _id: "$conversationId",
-                            lastMessage: { $last: "$message" },
-                            lastMessageTime: { $last: "$createdAt" },
-                            unreadCount: {
-                                $sum: { $cond: [{ $eq: ["$isRead", false] }, 1, 0] }
-                            },
-                            customer: { $first: "$sender" }
-                        }
-                    },
-                    // Sắp xếp theo thời gian tin nhắn cuối
-                    { $sort: { lastMessageTime: -1 } },
-                    // Giới hạn 20 conversation gần nhất
-                    { $limit: 20 }
-                ]);
+                const conversations = await Conversation.find({
+                    $or: [
+                        { staffId: null },
+                        { staffId: asObjectId(socket.userId) }
+                    ]
+                })
+                    .sort({ lastMessageAt: -1 })
+                    .limit(100)
+                    .populate("customerId", "name email phone")
+                    .lean();
 
-                // Populate thông tin customer
-                const populatedConversations = await ChatMessage.populate(conversations, {
-                    path: "customer",
-                    select: "name email phone"
+                const mappedConversations = conversations.map((conversation) => {
+                    const customer = conversation.customerId;
+                    return {
+                        id: `${conversation.customerId?._id || conversation.customerId}`,
+                        conversationId: `${conversation.customerId?._id || conversation.customerId}`,
+                        conversationRefId: conversation._id,
+                        customerId: `${conversation.customerId?._id || conversation.customerId}`,
+                        customerName: customer?.name || `Khách hàng ${conversation.customerId}`,
+                        customerInfo: customer || null,
+                        staffId: conversation.staffId,
+                        lastMessage: conversation.lastMessage,
+                        lastMessageTime: conversation.lastMessageAt,
+                        unreadCount: conversation.unreadCount
+                    };
                 });
 
                 socket.emit("active_conversations", {
-                    conversations: populatedConversations,
-                    count: populatedConversations.length
+                    conversations: mappedConversations,
+                    count: mappedConversations.length
                 });
 
-                console.log(`📋 Đã gửi ${populatedConversations.length} conversations cho staff ${socket.userId}`);
+                console.log(`📋 Đã gửi ${mappedConversations.length} conversations cho staff ${socket.userId}`);
 
             } catch (error) {
                 console.error("❌ Lỗi khi get conversations:", error);
@@ -847,7 +1270,7 @@ const chatSocketHandler = (io) => {
             const userRole = socket.userRole;
 
             // Nếu là staff → cập nhật trạng thái offline
-            if (userRole === "staff" && userId) {
+            if (isStaffRole(userRole) && userId) {
                 delete staffOnlineMap[userId];
 
                 // Broadcast số lượng staff online mới

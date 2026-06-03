@@ -1,31 +1,34 @@
 const mongoose = require("mongoose");
 const bcrypt = require("bcrypt");
 
+const USER_ROLES = ["admin", "cashier", "waiter", "customer", "staff", "chatbot"];
+
 const userSchema = new mongoose.Schema({
-    name : {
+    name: {
         type: String,
         required: true,
     },
 
-    email : {
+    email: {
         type: String,
         required: true,
         validate: {
             validator: function (v) {
                 return /\S+@\S+\.\S+/.test(v);
             },
-            message : "Email must be in valid format!"
+            message: "Email must be in valid format!"
         }
     },
 
     phone: {
-        type : Number,
+        type: String,
         required: true,
+        unique: true,
         validate: {
             validator: function (v) {
-                return /\d{10}/.test(v);
+                return /^\d{10}$/.test(`${v}`);
             },
-            message : "Phone number must be a 10-digit number!"
+            message: "Phone number must be 10 digits!"
         }
     },
 
@@ -36,12 +39,21 @@ const userSchema = new mongoose.Schema({
 
     role: {
         type: String,
-        required: true
+        required: true,
+        enum: USER_ROLES,
+        lowercase: true,
+        trim: true
+    },
+
+    accountStatus: {
+        type: String,
+        enum: ["pending", "approved", "locked"],
+        default: "pending"
     }
-}, { timestamps : true })
+}, { timestamps: true })
 
 userSchema.pre('save', async function (next) {
-    if(!this.isModified('password')){
+    if (!this.isModified('password')) {
         next();
     }
 

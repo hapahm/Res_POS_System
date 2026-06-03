@@ -1,16 +1,11 @@
 /**
- * CHATBOT SERVICE
- * Hybrid service: Rule-based matching + AI fallback
- * 
- * Flow:
- * 1. Try rule-based intent matching (fast, no API cost)
- * 2. If no rule matches → call AI service for intent classification
- * 3. AI returns structured JSON with intent and parameters
- * 4. Backend executes database query based on intent
- * 5. Return formatted response to user
+ * DỊCH VỤ CHATBOT
+ * Chế độ thuần rule-based.
+ *
+ * Luồng xử lý:
+ * 1. So khớp ý định (intent) bằng danh sách từ khóa.
+ * 2. Nếu không khớp intent nào, trả về FALLBACK_RESPONSE.
  */
-
-const AIService = require('./ai.service');
 
 /**
  * INTENTS - Các ý định người dùng có thể có
@@ -122,10 +117,10 @@ const INTENTS = {
         ],
         responses: [
             "📍 **Địa chỉ nhà hàng:**\n\n" +
-            "123 Đường Nguyễn Huệ, Quận 1\n" +
-            "TP. Hồ Chí Minh\n\n" +
+            "123 Đường Nguyễn Huệ, Quận Đống Đa\n" +
+            "TP. Hà Nội\n\n" +
             "🚗 Có bãi đậu xe miễn phí\n" +
-            "🚇 Gần ga metro Bến Thành\n\n" +
+            "🚇 Gần ga metro Tàu điện\n\n" +
             "Hẹn gặp quý khách! 😊"
         ]
     },
@@ -182,8 +177,8 @@ const FALLBACK_RESPONSE =
 class ChatbotService {
 
     /**
-     * Phân loại và trả lời tin nhắn người dùng
-     * Hybrid: Rule-based first, then AI if no match
+    * Phân loại và trả lời tin nhắn người dùng
+    * Pure rule-based
      * @param {string} userMessage - Tin nhắn từ người dùng
      * @returns {Promise<Object>} - { intent, response, requiresStaff, messageType, source }
      */
@@ -218,51 +213,15 @@ class ChatbotService {
             }
         }
 
-        // Step 2: Rule-based failed, try AI
-        console.log(`⚠️ No rule-based match, trying AI...`);
-
-        if (!AIService.shouldUseAI(userMessage)) {
-            console.log(`⏭️ Message too short for AI, using fallback`);
-            return {
-                intent: "FALLBACK",
-                response: FALLBACK_RESPONSE,
-                requiresStaff: false,
-                messageType: "chatbot",
-                source: 'FALLBACK'
-            };
-        }
-
-        try {
-            // Call AI service for intent classification
-            const aiResult = await AIService.classifyWithAI(userMessage);
-            console.log(`🤖 AI classified intent: ${aiResult.intent} (source: ${aiResult.source})`);
-
-            // Return AI classification with generic response
-            // (database query will be handled by backend based on intent + parameters)
-            return {
-                intent: aiResult.intent,
-                response: this.getResponseForIntent(aiResult.intent),
-                parameters: aiResult.parameters,
-                confidence: aiResult.confidence,
-                requiresStaff: aiResult.requiresStaff,
-                messageType: "chatbot",
-                source: aiResult.source
-            };
-
-        } catch (error) {
-            console.error(`❌ Error during AI classification:`, error.message);
-
-            // Final fallback: request human help
-            return {
-                intent: "CALL_STAFF",
-                response:
-                    "📞 **Xin lỗi, tôi gặp vấn đề kỹ thuật.**\n\n" +
-                    "Đang chuyển bạn đến nhân viên...",
-                requiresStaff: true,
-                messageType: "chatbot",
-                source: 'ERROR_FALLBACK'
-            };
-        }
+        // Step 2: Rule-based failed -> fallback mặc định
+        console.log(`⚠️ No rule-based match, using fallback response`);
+        return {
+            intent: "FALLBACK",
+            response: FALLBACK_RESPONSE,
+            requiresStaff: false,
+            messageType: "chatbot",
+            source: 'FALLBACK'
+        };
     }
 
     /**
